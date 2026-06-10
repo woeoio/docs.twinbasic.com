@@ -18,7 +18,7 @@
 
 import { compressHtml } from "./compress.mjs";
 
-export async function templatePhase(pages, site) {
+export async function templatePhase(pages, site, initData) {
   if (site.config.just_the_docs?.collections) {
     throw new Error(
       "site.config.just_the_docs.collections is set; Phase 4 (and Phase 2) "
@@ -26,7 +26,7 @@ export async function templatePhase(pages, site) {
     );
   }
 
-  const init = buildInit(site);
+  const init = initData ?? buildInit(site);
 
   await Promise.all(pages.map(async (page) => {
     if (page.frontmatter.layout === "book-combined") return;
@@ -34,20 +34,25 @@ export async function templatePhase(pages, site) {
   }));
 }
 
-// One-time per-build constants: pre-rendered SVG sprite, sidebar HTML,
-// header static parts, aux-nav, search-footer, mermaid script, favicon
-// link, GA snippet. Per §4 init order.
-function buildInit(site) {
+// Config-only chrome fields -- no nav-tree dependency. Exported for the
+// scheduler's buildInit task so it can run after discover, in parallel
+// with nav. Does not include sidebar; that is rendered by nav and merged
+// by dispatch.
+export function buildInitConfig(site) {
   return {
-    svgSprites: buildSvgSprites(site.config),
-    sidebar: renderSidebar(site),
-    header: renderHeader(site),
-    searchFooter: renderSearchFooter(site),
-    mermaidScript: renderMermaidScript(site),
-    faviconLink: buildFaviconLink(site.config),
-    gaSnippet: buildGaSnippet(site.config),
+    svgSprites:    buildSvgSprites(site.config),
+    header:        renderHeader(site),
+    searchFooter:  renderSearchFooter(site),
+    faviconLink:   buildFaviconLink(site.config),
+    gaSnippet:     buildGaSnippet(site.config),
     searchEnabled: site.config.search_enabled !== false,
   };
+}
+
+// Full init -- used by the templatePhase fallback (no scheduler) and tools.
+export { buildInit as buildInitFn, renderSidebar };
+function buildInit(site) {
+  return { ...buildInitConfig(site), sidebar: renderSidebar(site) };
 }
 
 // ---------- §5.1 templatePage --------------------------------------------
@@ -66,7 +71,7 @@ function templatePage(page, site, init) {
   // compress collapses them to single spaces. The body assembly mirrors
   // _layouts/default.html: skip-to-main link, icon sprite, sidebar,
   // <div class="main">, header, breadcrumbs, <main> wrapping body +
-  // children-nav, footer, then per-page-search-footer, then mermaid.
+  // children-nav, footer, then per-page-search-footer.
   const html =
     `<!DOCTYPE html>\n` +
     `<html lang="${escAttr(lang)}">\n` +
@@ -89,7 +94,6 @@ function templatePage(page, site, init) {
     `    </div>\n` +
     (init.searchEnabled ? init.searchFooter + `\n` : "") +
     `  </div>\n` +
-    (init.mermaidScript ? init.mermaidScript + `\n` : "") +
     `</body>\n` +
     `</html>\n`;
 
@@ -124,6 +128,7 @@ function renderHead(page, site, init) {
     (init.searchEnabled ? `  <script src="${escAttr(relativeUrl("/assets/js/vendor/lunr.min.js", bu))}"></script>\n` : "") +
     (bu ? `  <script>window.jtdBaseurl=${JSON.stringify(bu)};</script>\n` : "") +
     `  <script src="${escAttr(relativeUrl("/assets/js/just-the-docs.js", bu))}"></script>\n` +
+    (page.hasSvg ? `  <script src="${escAttr(relativeUrl("/assets/js/svg-inline.js", bu))}" defer></script>\n` : "") +
     `  <meta name="viewport" content="width=device-width, initial-scale=1">\n` +
     headSeoBlock(page, site) +
     init.faviconLink +
@@ -726,7 +731,7 @@ function renderFooterCustom(page, config) {
 function renderEditAndOfflineBlock(page, config) {
   const showEdit = config.gh_edit_link && config.gh_edit_link_text && config.gh_edit_repository
     && config.gh_edit_branch && config.gh_edit_view_mode;
-  const showOffline = config.gh_offline_link && config.gh_offline_link_text && config.gh_offline_link_url;
+  const showOffline = config.gh_offline_link && config.gh_offline_link_url;
   const showLastModified = config.last_edit_timestamp && config.last_edit_time_format
     && page.frontmatter.last_modified_date;
 
@@ -750,9 +755,17 @@ function renderEditAndOfflineBlock(page, config) {
       `        </p>\n`;
   }
   if (showOffline) {
-    inner += `        <p class="text-small text-grey-dk-000 mb-0">\n` +
-      `          <a href="${escAttr(String(config.gh_offline_link_url))}" id="download-offline">${escText(String(config.gh_offline_link_text))}</a>\n` +
-      `        </p>\n`;
+    const pdfUrl = config.gh_pdf_link_url ? String(config.gh_pdf_link_url) : null;
+    const offlineHref = escAttr(String(config.gh_offline_link_url));
+    if (pdfUrl) {
+      inner += `        <p class="text-small text-grey-dk-000 mb-0">\n` +
+        `          Download <a href="${offlineHref}" id="download-offline">Offline Copy</a> or <a href="${escAttr(pdfUrl)}" id="download-pdf">PDF</a>.\n` +
+        `        </p>\n`;
+    } else {
+      inner += `        <p class="text-small text-grey-dk-000 mb-0">\n` +
+        `          <a href="${offlineHref}" id="download-offline">Offline Copy</a>\n` +
+        `        </p>\n`;
+    }
   }
 
   return `        <div class="d-flex mt-2">\n` + inner + `        </div>\n`;
@@ -787,19 +800,6 @@ function renderSearchFooter(site) {
   return button + `    <div class="search-overlay"></div>`;
 }
 
-// ---------- §5.13 renderMermaidScript ------------------------------------
-
-function renderMermaidScript(site) {
-  const m = site.config.mermaid;
-  if (!m) return "";
-  const version = m.version ?? "latest";
-  const extra = site.config.mermaid_config ?? "";
-  return `  <script src="https://cdn.jsdelivr.net/npm/mermaid@${version}/dist/mermaid.min.js"></script>\n` +
-    `  <script>\n` +
-    `    mermaid.initialize({ startOnLoad: true });\n` +
-    (extra ? `    ${extra}\n` : "") +
-    `  </script>`;
-}
 
 // ---------- §6.2 / §6.3 URL helpers --------------------------------------
 
